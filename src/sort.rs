@@ -1,8 +1,6 @@
 use indexmap::IndexMap;
 use ndarray::prelude::*;
 use ndarray::{Data, DataMut, Slice};
-use rand::prelude::*;
-use rand::thread_rng;
 
 /// Methods for sorting and partitioning 1-D arrays.
 pub trait Sort1dExt<A, S>
@@ -22,10 +20,9 @@ where
     /// No other assumptions should be made on the ordering of the
     /// elements after this computation.
     ///
-    /// Complexity ([quickselect](https://en.wikipedia.org/wiki/Quickselect)):
-    /// - average case: O(`n`);
-    /// - worst case: O(`n`^2);
-    /// where n is the number of elements in the array.
+    /// This method performs [Sesquickselect].
+    ///
+    /// [Sesquickselect]: https://www.wild-inter.net/publications/martinez-nebel-wild-2019.pdf
     ///
     /// **Panics** if `i` is greater than or equal to `n`.
     fn get_from_sorted_mut(&mut self, i: usize) -> A
@@ -99,6 +96,58 @@ where
         A: Ord + Clone,
         S: DataMut;
 
+    /// Partitions the array in increasing order based on the values initially located at the two
+    /// pivot indexes `lower` and `upper` and returns the new indexes of their values.
+    ///
+    /// The elements are rearranged in such a way that the two pivot values are moved to the indexes
+    /// they would be in an array sorted in increasing order. The return values are the new indexes
+    /// of the values after rearrangement. All elements less than the values are moved to their left
+    /// and all elements equal or greater than the values are moved to their right. The ordering of
+    /// the elements in the three partitions is undefined.
+    ///
+    /// The array is shuffled **in place**, no copy of the array is allocated.
+    ///
+    /// This method performs [dual-pivot partitioning].
+    ///
+    /// [dual-pivot partitioning]: https://www.wild-inter.net/publications/wild-2018b.pdf
+    ///
+    /// **Panics** if `lower` or `upper` is out of bound.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ndarray::array;
+    /// use ndarray_stats::Sort1dExt;
+    ///
+    /// let mut data = array![3, 1, 4, 5, 2];
+    /// // Skewed pivot values.
+    /// let (lower_value, upper_value) = (1, 5);
+    ///
+    /// // Partitions by the values located at `1` and `3`.
+    /// let (lower_index, upper_index) = data.dual_partition_mut(1, 3);
+    /// // The pivot values are now located at `lower_index` and `upper_index`.
+    /// assert_eq!(data[lower_index], lower_value);
+    /// assert_eq!(data[upper_index], upper_value);
+    /// // Elements lower than the lower pivot value are moved to its left.
+    /// for i in 0..lower_index {
+    ///     assert!(data[i] < lower_value);
+    /// }
+    /// // Elements greater than or equal the lower pivot value and less than or equal the upper
+    /// // pivot value are moved between the two pivot indexes.
+    /// for i in lower_index + 1..upper_index {
+    ///     assert!(lower_value <= data[i]);
+    ///     assert!(data[i] <= upper_value);
+    /// }
+    /// // Elements greater than or equal the upper pivot value are moved to its right.
+    /// for i in upper_index + 1..data.len() {
+    ///     assert!(upper_value <= data[i]);
+    /// }
+    /// ```
+    fn dual_partition_mut(&mut self, lower: usize, upper: usize) -> (usize, usize)
+    where
+        A: Ord + Clone,
+        S: DataMut;
+
     private_decl! {}
 }
 
@@ -112,20 +161,68 @@ where
         S: DataMut,
     {
         let n = self.len();
-        if n == 1 {
-            self[0].clone()
+        // Recursion cutoff at integer multiple of sample space divider of 7 elements.
+        if n < 21 {
+            for mut index in 1..n {
+                while index > 0 && self[index - 1] > self[index] {
+                    self.swap(index - 1, index);
+                    index -= 1;
+                }
+            }
+            self[i].clone()
         } else {
-            let mut rng = thread_rng();
-            let pivot_index = rng.gen_range(0..n);
-            let partition_index = self.partition_mut(pivot_index);
-            if i < partition_index {
-                self.slice_axis_mut(Axis(0), Slice::from(..partition_index))
-                    .get_from_sorted_mut(i)
-            } else if i == partition_index {
-                self[i].clone()
+            // Sorted sample of 5 equally spaced elements around the center.
+            let mut sample = [0; 5];
+            sample_mut(self, &mut sample);
+            // Adapt pivot sampling to relative sought rank and switch from dual-pivot to
+            // single-pivot partitioning for extreme sought ranks.
+            let sought_rank = i as f64 / n as f64;
+            if (0.036..=0.964).contains(&sought_rank) {
+                let (lower_index, upper_index) = if sought_rank <= 0.5 {
+                    if sought_rank <= 0.153 {
+                        (0, 1) // (0, 0, 3)
+                    } else {
+                        (0, 2) // (0, 1, 2)
+                    }
+                } else {
+                    if sought_rank <= 0.847 {
+                        (2, 4) // (2, 1, 0)
+                    } else {
+                        (3, 4) // (3, 0, 0)
+                    }
+                };
+                let (lower_index, upper_index) =
+                    self.dual_partition_mut(sample[lower_index], sample[upper_index]);
+                if i < lower_index {
+                    self.slice_axis_mut(Axis(0), Slice::from(..lower_index))
+                        .get_from_sorted_mut(i)
+                } else if i == lower_index {
+                    self[i].clone()
+                } else if i < upper_index {
+                    self.slice_axis_mut(Axis(0), Slice::from(lower_index + 1..upper_index))
+                        .get_from_sorted_mut(i - (lower_index + 1))
+                } else if i == upper_index {
+                    self[i].clone()
+                } else {
+                    self.slice_axis_mut(Axis(0), Slice::from(upper_index + 1..))
+                        .get_from_sorted_mut(i - (upper_index + 1))
+                }
             } else {
-                self.slice_axis_mut(Axis(0), Slice::from(partition_index + 1..))
-                    .get_from_sorted_mut(i - (partition_index + 1))
+                let pivot_index = if sought_rank <= 0.5 {
+                    0 // (0, 4)
+                } else {
+                    4 // (4, 0)
+                };
+                let pivot_index = self.partition_mut(sample[pivot_index]);
+                if i < pivot_index {
+                    self.slice_axis_mut(Axis(0), Slice::from(..pivot_index))
+                        .get_from_sorted_mut(i)
+                } else if i == pivot_index {
+                    self[i].clone()
+                } else {
+                    self.slice_axis_mut(Axis(0), Slice::from(pivot_index + 1..))
+                        .get_from_sorted_mut(i - (pivot_index + 1))
+                }
             }
         }
     }
@@ -179,6 +276,56 @@ where
         }
         self.swap(0, i - 1);
         i - 1
+    }
+
+    fn dual_partition_mut(&mut self, lower: usize, upper: usize) -> (usize, usize)
+    where
+        A: Ord + Clone,
+        S: DataMut,
+    {
+        let lowermost = 0;
+        let uppermost = self.len() - 1;
+        // Swap pivots with outermost elements.
+        self.swap(lowermost, lower);
+        self.swap(uppermost, upper);
+        if self[lowermost] > self[uppermost] {
+            // Sort pivots instead of panicking via assertion.
+            self.swap(lowermost, uppermost);
+        }
+        // Increasing running and partition index starting after lower pivot.
+        let mut index = lowermost + 1;
+        let mut lower = lowermost + 1;
+        // Decreasing partition index starting before upper pivot.
+        let mut upper = uppermost - 1;
+        // Swap elements at `index` into their partitions.
+        while index <= upper {
+            if self[index] < self[lowermost] {
+                // Swap elements into lower partition.
+                self.swap(index, lower);
+                lower += 1;
+            } else if self[index] >= self[uppermost] {
+                // Search first element of upper partition.
+                while self[upper] > self[uppermost] && index < upper {
+                    upper -= 1;
+                }
+                // Swap elements into upper partition.
+                self.swap(index, upper);
+                if self[index] < self[lowermost] {
+                    // Swap swapped elements into lower partition.
+                    self.swap(index, lower);
+                    lower += 1;
+                }
+                upper -= 1;
+            }
+            index += 1;
+        }
+        lower -= 1;
+        upper += 1;
+        // Swap pivots to their new indexes.
+        self.swap(lowermost, lower);
+        self.swap(uppermost, upper);
+        // Lower and upper pivot index.
+        (lower, upper)
     }
 
     private_impl! {}
@@ -240,59 +387,188 @@ fn _get_many_from_sorted_mut_unchecked<A>(
         return;
     }
 
-    // At this point, `n >= 1` since `indexes.len() >= 1`.
-    if n == 1 {
-        // We can only reach this point if `indexes.len() == 1`, so we only
-        // need to assign the single value, and then we're done.
-        debug_assert_eq!(indexes.len(), 1);
-        values[0] = array[0].clone();
+    // Recursion cutoff at integer multiple of sample space divider of 7 elements.
+    if n < 21 {
+        for mut index in 1..n {
+            while index > 0 && array[index - 1] > array[index] {
+                array.swap(index - 1, index);
+                index -= 1;
+            }
+        }
+        for (value, index) in values.iter_mut().zip(indexes.iter()) {
+            *value = array[*index].clone();
+        }
         return;
     }
 
-    // We pick a random pivot index: the corresponding element is the pivot value
-    let mut rng = thread_rng();
-    let pivot_index = rng.gen_range(0..n);
+    // Sorted sample of 5 equally spaced elements around the center.
+    let mut sample = [0; 5];
+    sample_mut(&mut array, &mut sample);
+    let (lower_index, upper_index) = if indexes.len() == 1 {
+        // Adapt pivot sampling to relative sought rank and switch from dual-pivot to single-pivot
+        // partitioning for extreme sought ranks.
+        let sought_rank = indexes[0] as f64 / n as f64;
+        if (0.036..=0.964).contains(&sought_rank) {
+            if sought_rank <= 0.5 {
+                if sought_rank <= 0.153 {
+                    (0, 1) // (0, 0, 3)
+                } else {
+                    (0, 2) // (0, 1, 2)
+                }
+            } else {
+                if sought_rank <= 0.847 {
+                    (2, 4) // (2, 1, 0)
+                } else {
+                    (3, 4) // (3, 0, 0)
+                }
+            }
+        } else {
+            let pivot_index = if sought_rank <= 0.5 {
+                0 // (0, 4)
+            } else {
+                4 // (4, 0)
+            };
 
-    // We partition the array with respect to the pivot value.
-    // The pivot value moves to `array_partition_index`.
-    // Elements strictly smaller than the pivot value have indexes < `array_partition_index`.
-    // Elements greater or equal to the pivot value have indexes > `array_partition_index`.
-    let array_partition_index = array.partition_mut(pivot_index);
+            // We partition the array with respect to the pivot value. The pivot value moves to the
+            // new `pivot_index`.
+            //
+            // Elements strictly less than the pivot value have indexes < `pivot_index`.
+            //
+            // Elements greater than or equal the pivot value have indexes > `pivot_index`.
+            let pivot_index = array.partition_mut(sample[pivot_index]);
+            let (found_exact, split_index) = match indexes.binary_search(&pivot_index) {
+                Ok(index) => (true, index),
+                Err(index) => (false, index),
+            };
+            let (lower_indexes, upper_indexes) = indexes.split_at_mut(split_index);
+            let (lower_values, upper_values) = values.split_at_mut(split_index);
+            let (upper_indexes, upper_values) = if found_exact {
+                upper_values[0] = array[pivot_index].clone(); // Write exactly found value.
+                (&mut upper_indexes[1..], &mut upper_values[1..])
+            } else {
+                (upper_indexes, upper_values)
+            };
 
-    // We use a divide-and-conquer strategy, splitting the indexes we are
-    // searching for (`indexes`) and the corresponding portions of the output
-    // slice (`values`) into pieces with respect to `array_partition_index`.
-    let (found_exact, index_split) = match indexes.binary_search(&array_partition_index) {
+            // We search recursively for the values corresponding to indexes strictly less than
+            // `pivot_index` in the lower partition.
+            _get_many_from_sorted_mut_unchecked(
+                array.slice_axis_mut(Axis(0), Slice::from(..pivot_index)),
+                lower_indexes,
+                lower_values,
+            );
+
+            // We search recursively for the values corresponding to indexes greater than or equal
+            // `pivot_index` in the upper partition. Since only the upper partition of the array is
+            // passed in, the indexes need to be shifted by length of the lower partition.
+            upper_indexes.iter_mut().for_each(|x| *x -= pivot_index + 1);
+            _get_many_from_sorted_mut_unchecked(
+                array.slice_axis_mut(Axis(0), Slice::from(pivot_index + 1..)),
+                upper_indexes,
+                upper_values,
+            );
+
+            return;
+        }
+    } else {
+        // Since there is no single sought rank to adapt pivot sampling to, the recommended skewed
+        // pivot sampling of dual-pivot Quicksort is used in the assumption that multiple indexes
+        // change characteristics from Quickselect towards Quicksort.
+        (0, 2) // (0, 1, 2)
+    };
+
+    // We partition the array with respect to the two pivot values. The pivot values move to the new
+    // `lower_index` and `upper_index`.
+    //
+    // Elements strictly less than the lower pivot value have indexes < `lower_index`.
+    //
+    // Elements greater than or equal the lower pivot value and less than or equal the upper pivot
+    // value have indexes > `lower_index` and < `upper_index`.
+    //
+    // Elements greater than or equal the upper pivot value have indexes > `upper_index`.
+    let (lower_index, upper_index) =
+        array.dual_partition_mut(sample[lower_index], sample[upper_index]);
+
+    // We use a divide-and-conquer strategy, splitting the indexes we are searching for (`indexes`)
+    // and the corresponding portions of the output slice (`values`) into partitions with respect to
+    // `lower_index` and `upper_index`.
+    let (found_exact, split_index) = match indexes.binary_search(&lower_index) {
         Ok(index) => (true, index),
         Err(index) => (false, index),
     };
-    let (smaller_indexes, other_indexes) = indexes.split_at_mut(index_split);
-    let (smaller_values, other_values) = values.split_at_mut(index_split);
-    let (bigger_indexes, bigger_values) = if found_exact {
-        other_values[0] = array[array_partition_index].clone(); // Write exactly found value.
-        (&mut other_indexes[1..], &mut other_values[1..])
+    let (lower_indexes, inner_indexes) = indexes.split_at_mut(split_index);
+    let (lower_values, inner_values) = values.split_at_mut(split_index);
+    let (upper_indexes, upper_values) = if found_exact {
+        inner_values[0] = array[lower_index].clone(); // Write exactly found value.
+        (&mut inner_indexes[1..], &mut inner_values[1..])
     } else {
-        (other_indexes, other_values)
+        (inner_indexes, inner_values)
     };
 
-    // We search recursively for the values corresponding to strictly smaller
-    // indexes to the left of `partition_index`.
+    let (found_exact, split_index) = match upper_indexes.binary_search(&upper_index) {
+        Ok(index) => (true, index),
+        Err(index) => (false, index),
+    };
+    let (inner_indexes, upper_indexes) = upper_indexes.split_at_mut(split_index);
+    let (inner_values, upper_values) = upper_values.split_at_mut(split_index);
+    let (upper_indexes, upper_values) = if found_exact {
+        upper_values[0] = array[upper_index].clone(); // Write exactly found value.
+        (&mut upper_indexes[1..], &mut upper_values[1..])
+    } else {
+        (upper_indexes, upper_values)
+    };
+
+    // We search recursively for the values corresponding to indexes strictly less than
+    // `lower_index` in the lower partition.
     _get_many_from_sorted_mut_unchecked(
-        array.slice_axis_mut(Axis(0), Slice::from(..array_partition_index)),
-        smaller_indexes,
-        smaller_values,
+        array.slice_axis_mut(Axis(0), Slice::from(..lower_index)),
+        lower_indexes,
+        lower_values,
     );
 
-    // We search recursively for the values corresponding to strictly bigger
-    // indexes to the right of `partition_index`. Since only the right portion
-    // of the array is passed in, the indexes need to be shifted by length of
-    // the removed portion.
-    bigger_indexes
-        .iter_mut()
-        .for_each(|x| *x -= array_partition_index + 1);
+    // We search recursively for the values corresponding to indexes greater than or equal
+    // `lower_index` in the inner partition, that is between the lower and upper partition. Since
+    // only the inner partition of the array is passed in, the indexes need to be shifted by length
+    // of the lower partition.
+    inner_indexes.iter_mut().for_each(|x| *x -= lower_index + 1);
     _get_many_from_sorted_mut_unchecked(
-        array.slice_axis_mut(Axis(0), Slice::from(array_partition_index + 1..)),
-        bigger_indexes,
-        bigger_values,
+        array.slice_axis_mut(Axis(0), Slice::from(lower_index + 1..upper_index)),
+        inner_indexes,
+        inner_values,
     );
+
+    // We search recursively for the values corresponding to indexes greater than or equal
+    // `upper_index` in the upper partition. Since only the upper partition of the array is passed
+    // in, the indexes need to be shifted by the combined length of the lower and inner partition.
+    upper_indexes.iter_mut().for_each(|x| *x -= upper_index + 1);
+    _get_many_from_sorted_mut_unchecked(
+        array.slice_axis_mut(Axis(0), Slice::from(upper_index + 1..)),
+        upper_indexes,
+        upper_values,
+    );
+}
+
+/// Equally space `sample` indexes around the center of `array` and sort them by their values.
+///
+/// `sample` content is ignored but its length defines the sample size and the sample space divider.
+///
+/// Assumes arrays of at least `sample.len() + 2` elements.
+pub(crate) fn sample_mut<A, S>(array: &mut ArrayBase<S, Ix1>, sample: &mut [usize])
+where
+    A: Ord + Clone,
+    S: DataMut<Elem = A>,
+{
+    // Space between sample indexes.
+    let space = array.len() / (sample.len() + 2);
+    // Lowermost sample index.
+    let lowermost = array.len() / 2 - (sample.len() / 2) * space;
+    // Equally space sample indexes and sort them by their values by looking up their indexes.
+    for mut index in 1..sample.len() {
+        // Equally space sample indexes based on their lowermost index.
+        sample[index] = lowermost + index * space;
+        // Insertion sort looking up only the already equally spaced sample indexes.
+        while index > 0 && array[sample[index - 1]] > array[sample[index]] {
+            array.swap(sample[index - 1], sample[index]);
+            index -= 1;
+        }
+    }
 }
